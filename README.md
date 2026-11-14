@@ -4,8 +4,6 @@ A lightweight Windows calendar and task manager built as a
 [Rainmeter](https://www.rainmeter.net/) skin, with optional two-way Google
 Calendar and Google Tasks sync.
 
-![Illustrative Chopper To-Do calendar preview](assets/chopper-todo-preview.svg)
-
 ## Features
 
 - Monthly calendar with previous/next month navigation.
