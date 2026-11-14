@@ -1,6 +1,6 @@
 -- Chopper To-Do : calendar + task list logic for Rainmeter
 -- Tasks and events live in @Resources\tasks.txt, one per line:
---   done|date|start|end|kind|text
+--   done|date|start|end|kind|id|text
 -- Older done|date|start|end|text and done|date|text lines still load.
 
 local TASK_ROWS, EVENT_ROWS = 4, 4
@@ -11,7 +11,9 @@ local viewY, viewM = 2000, 1
 local selected = nil                -- 'YYYY-MM-DD' of the clicked day, or nil
 local taskOffset, eventOffset = 0, 0
 local weekStart = 0                 -- 0 = Sunday first, 1 = Monday first
-local file, todayKey = '', ''
+local file, todayKey, futureLimitKey = '', '', ''
+local syncEnabled, lastSyncRequest = false, 0
+local idSequence = 0
 local adding = false
 local addingKind = 'task'
 local startMinutes, endMinutes = 480, 540
@@ -27,6 +29,14 @@ end
 
 local function key(y, m, d) return string.format('%04d-%02d-%02d', y, m, d) end
 
+local function oneYearLater(t)
+  local year, month = t.year + 1, t.month
+  local lastDay = os.date('*t', os.time{
+    year = year, month = month + 1, day = 0, hour = 12
+  }).day
+  return key(year, month, math.min(t.day, lastDay))
+end
+
 local function fmtDate(k)
   local y, m, d = tostring(k):match('^(%d+)%-(%d+)%-(%d+)$')
   if not y then return tostring(k) end
@@ -34,16 +44,36 @@ local function fmtDate(k)
   return os.date('%b ', ts) .. tonumber(d)
 end
 
+local function newId()
+  idSequence = idSequence + 1
+  return string.format('%08x-%08x-%d', os.time(),
+                       math.random(0, 0x7fffffff), idSequence)
+end
+
+local function requestSync()
+  if not syncEnabled then return end
+  lastSyncRequest = os.time()
+  local script = SKIN:ReplaceVariables('#CURRENTPATH#Sync.vbs')
+  SKIN:Bang('!Execute ["wscript.exe" "' .. script .. '"]')
+end
+
 ------------------------------------------------------------------ storage
+
+local save
 
 local function load()
   tasks = {}
   local f = io.open(file, 'r')
   if not f then return end
+  local changed = false
   for line in f:lines() do
     line = line:gsub('^\239\187\191', ''):gsub('\r$', '')
-    local d, dt, start, finish, kind, txt =
+    local d, dt, start, finish, kind, id, txt =
+      line:match('^([01])|([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)|(.*)$')
+    if not d then
+      d, dt, start, finish, kind, txt =
       line:match('^([01])|([^|]*)|([^|]*)|([^|]*)|([^|]*)|(.*)$')
+    end
     if not d then
       d, dt, start, finish, txt =
         line:match('^([01])|([^|]*)|([^|]*)|([^|]*)|(.*)$')
@@ -52,25 +82,40 @@ local function load()
       d, dt, txt = line:match('^([01])|([^|]*)|(.*)$')
     end
     if d and txt ~= '' then
+      if id and not id:match('^[%x]+%-[%x]+%-[%d]+$') then
+        txt, id = id .. '|' .. txt, nil
+      end
+      local itemKind = (kind == 'event') and 'event' or 'task'
+      start, finish = start or '', finish or ''
+      if itemKind == 'task' then
+        if start ~= '' or finish ~= '' then changed = true end
+        start, finish = '', ''
+      end
+      if not id or id == '' then id, changed = newId(), true end
       tasks[#tasks + 1] = {
-        done = (d == '1'), date = dt, start = start or '',
-        finish = finish or '', kind = (kind == 'event') and 'event' or 'task',
-        text = txt
+        done = (d == '1'), date = dt, start = start,
+        finish = finish, kind = itemKind, text = txt, id = id
       }
     end
   end
   f:close()
+  if changed and save then save(false) end
 end
 
-local function save()
+save = function(sync)
   local f = io.open(file, 'w')
-  if not f then return end
+  if not f then
+    SKIN:Bang('!Log "Chopper To-Do could not write tasks.txt." Error')
+    return false
+  end
   for _, t in ipairs(tasks) do
     f:write((t.done and '1' or '0') .. '|' .. t.date .. '|' .. (t.start or '') ..
             '|' .. (t.finish or '') .. '|' .. (t.kind or 'task') ..
-            '|' .. t.text .. '\n')
+            '|' .. (t.id or '') .. '|' .. t.text .. '\n')
   end
   f:close()
+  if sync then requestSync() end
+  return true
 end
 
 ------------------------------------------------------------------ state
@@ -78,6 +123,8 @@ end
 function Initialize()
   file = SKIN:ReplaceVariables('#CURRENTPATH#tasks.txt')
   weekStart = tonumber(var('WeekStart', '0')) or 0
+  syncEnabled = var('GoogleSyncEnabled', '0') == '1'
+  math.randomseed(os.time() + math.floor(os.clock() * 100000))
   local t = os.date('*t')
   viewY, viewM = t.year, t.month
   selected, taskOffset, eventOffset = nil, 0, 0
@@ -85,11 +132,17 @@ end
 
 function Refresh()
   load()
-  todayKey = os.date('%Y-%m-%d')
+  local today = os.date('*t')
+  todayKey = key(today.year, today.month, today.day)
+  futureLimitKey = oneYearLater(today)
+  if syncEnabled and os.time() - lastSyncRequest >= 300 then
+    lastSyncRequest = os.time()
+    requestSync()
+  end
 
   counts = {}
   for _, t in ipairs(tasks) do
-    if t.date ~= '' then
+    if t.date ~= '' and (t.kind ~= 'event' or t.date >= todayKey) then
       local c = counts[t.date] or {open = 0, done = 0, events = 0}
       if t.kind == 'event' then
         c.events = c.events + 1
@@ -112,7 +165,13 @@ function Refresh()
 
   taskVis, eventVis = {}, {}
   for i, t in ipairs(tasks) do
-    if not selected or t.date == selected then
+    local notPastEvent = t.kind ~= 'event' or t.date == '' or t.date >= todayKey
+    local visible = selected and notPastEvent and t.date == selected
+    if not selected then
+      visible = t.date == '' or
+                (t.date >= todayKey and t.date <= futureLimitKey)
+    end
+    if visible then
       local item = {i = i, t = t}
       if t.kind == 'event' then
         eventVis[#eventVis + 1] = item
@@ -268,8 +327,8 @@ end
 
 function RowDate(n)
   local r = taskRow(n)
-  if not r or selected or r.t.date == '' then return '' end
-  return fmtDate(r.t.date)
+  if not r or r.t.date == '' then return '' end
+  return 'Due ' .. fmtDate(r.t.date)
 end
 
 local function formatTime(minutes)
@@ -294,7 +353,11 @@ local function rowTime(r)
   return start .. '-' .. finish
 end
 
-function RowTime(n) return rowTime(taskRow(n)) end
+function RowTime(n)
+  local r = taskRow(n)
+  if r and r.t.kind == 'task' then return '' end
+  return rowTime(r)
+end
 
 function RowDateColor(n)
   local r = taskRow(n)
@@ -417,7 +480,22 @@ end
 function Adding() return adding and 0 or 1 end
 function NotAdding() return adding and 1 or 0 end
 
-function TimeVisible() return adding and 0 or 1 end
+function TimeVisible()
+  return adding and addingKind == 'event' and 0 or 1
+end
+function TaskDueDateHidden()
+  return adding and addingKind == 'task' and 0 or 1
+end
+function TaskDueDateLabel()
+  return selected and ('Due ' .. fmtDate(selected)) or 'No due date selected'
+end
+function StartTimeVisible()
+  return adding and addingKind == 'event' and 0 or 1
+end
+function EndLabelText() return addingKind == 'task' and 'Due' or 'End' end
+function EndLabelX() return addingKind == 'task' and 346 or 492 end
+function EndTimeBoxX() return addingKind == 'task' and 384 or 520 end
+function EndTimeTextX() return addingKind == 'task' and 432 or 574 end
 
 function TimeDropdownHidden()
   return adding and openDropdown and 0 or 1
@@ -461,6 +539,7 @@ end
 
 function OpenTimeDropdown(which)
   if not adding then return end
+  if which == 'end' and addingKind == 'task' then which = 'due' end
   if openDropdown == which then
     openDropdown = nil
   else
@@ -528,19 +607,19 @@ end
 
 function Toggle(n)
   local r = taskRow(n)
-  if r then r.t.done = not r.t.done; save() end
+  if r then r.t.done = not r.t.done; save(true) end
   redraw()
 end
 
 function DeleteTask(n)
   local r = taskRow(n)
-  if r then table.remove(tasks, r.i); save() end
+  if r then table.remove(tasks, r.i); save(true) end
   redraw()
 end
 
 function DeleteEvent(n)
   local r = eventRow(n)
-  if r then table.remove(tasks, r.i); save() end
+  if r then table.remove(tasks, r.i); save(true) end
   redraw()
 end
 
@@ -572,12 +651,15 @@ function AddFromVar()
   tasks[#tasks + 1] = {
     done = false,
     date = date,
-    start = string.format('%02d:%02d', math.floor(startMinutes / 60), startMinutes % 60),
-    finish = string.format('%02d:%02d', math.floor(endMinutes / 60), endMinutes % 60),
+    start = addingKind == 'event' and
+      string.format('%02d:%02d', math.floor(startMinutes / 60), startMinutes % 60) or '',
+    finish = addingKind == 'event' and
+      string.format('%02d:%02d', math.floor(endMinutes / 60), endMinutes % 60) or '',
     kind = addingKind,
-    text = s
+    text = s,
+    id = newId()
   }
-  save()
+  save(true)
   taskOffset, eventOffset = 0, 0
   adding, openDropdown, inputReady = false, nil, false
   addingKind = 'task'

@@ -1,0 +1,11 @@
+ChopperTodo/credentials.json
+ChopperTodo/token.json
+ChopperTodo/sync-state.json
+ChopperTodo/sync-conflicts.json
+ChopperTodo/sync.log
+ChopperTodo/sync.lock
+ChopperTodo/*.tmp
+ChopperTodo/.venv/
+ChopperTodo/__pycache__/
+.venv/
+Secrets/
